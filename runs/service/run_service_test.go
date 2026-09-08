@@ -64,6 +64,22 @@ func settingsWithQueue(t *testing.T, org, queue string) *repoMocks.SettingsRepo 
 	return m
 }
 
+// settingsWithPodTemplate returns a settings repo holding one org-level row naming a
+// pod template. The row key must match what fetchLevels asks for, or the lookup
+// aligns to nothing.
+func settingsWithPodTemplate(t *testing.T, org, name string) *repoMocks.SettingsRepo {
+	t.Helper()
+	data, err := protojson.Marshal(&settings.Settings{
+		PodTemplateName: &settings.StringSetting{State: stateValue, StringValue: name},
+	})
+	require.NoError(t, err)
+
+	m := &repoMocks.SettingsRepo{}
+	m.On("GetSettingsByKeys", mock.Anything, mock.Anything).
+		Return([]*models.Settings{{Key: models.EncodeSettingsKey(org, "", ""), Data: data, Version: 1}}, nil)
+	return m
+}
+
 // newMockProjectClientAlwaysOK returns a mock ProjectServiceClient whose GetProject always succeeds.
 func newMockProjectClientAlwaysOK(t *testing.T) *projectMocks.ProjectServiceClient {
 	pc := projectMocks.NewProjectServiceClient(t)
@@ -1521,6 +1537,60 @@ func TestCreateRun_AppliesSettingsQueue(t *testing.T) {
 
 	actionsClient.On("Enqueue", mock.Anything, mock.MatchedBy(func(req *connect.Request[actions.EnqueueRequest]) bool {
 		return req.Msg.GetRunSpec().GetQueue() == "fast-queue"
+	})).Return(connect.NewResponse(&actions.EnqueueResponse{}), nil).Once()
+
+	_, err := svc.CreateRun(context.Background(), connect.NewRequest(req))
+	require.NoError(t, err)
+}
+
+// TestCreateRun_AppliesSettingsPodTemplate proves the task applier is wired into run
+// creation: the task names no pod template, and the name on the enqueued task comes
+// from the org's settings row.
+func TestCreateRun_AppliesSettingsPodTemplate(t *testing.T) {
+	actionRepo := &repoMocks.ActionRepo{}
+	taskRepo := &repoMocks.TaskRepo{}
+	actionsClient := actionsconnectmocks.NewActionsServiceClient(t)
+	repo := &repoMocks.Repository{}
+	store := &storageMocks.ComposedProtobufStore{}
+	dataStore := &storage.DataStore{ComposedProtobufStore: store}
+
+	repo.On("ActionRepo").Return(actionRepo)
+	repo.On("TaskRepo").Return(taskRepo)
+
+	svc := &RunService{
+		repo:          repo,
+		settingsRepo:  settingsWithPodTemplate(t, "org", "gpu-template"),
+		actionsClient: actionsClient,
+		projectClient: newMockProjectClientAlwaysOK(t),
+		storagePrefix: "s3://flyte-data",
+		dataStore:     dataStore,
+	}
+
+	req := &workflow.CreateRunRequest{
+		Id: &workflow.CreateRunRequest_RunId{
+			RunId: &common.RunIdentifier{
+				Org:     "org",
+				Project: "proj",
+				Domain:  "dev",
+				Name:    "pt-123",
+			},
+		},
+		InputWrapper: &workflow.CreateRunRequest_Inputs{Inputs: &task.Inputs{}},
+		Task: &workflow.CreateRunRequest_TaskSpec{
+			TaskSpec: &task.TaskSpec{TaskTemplate: &core.TaskTemplate{}},
+		},
+	}
+
+	store.On("WriteProtobuf", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
+	taskRepo.On("CreateTaskSpec", mock.Anything, mock.Anything).Return(nil).Once()
+	actionRepo.On("CreateAction", mock.Anything, mock.Anything, mock.Anything).Return(&models.Run{
+		Project: "proj",
+		Domain:  "dev",
+		Name:    "pt-123",
+	}, nil).Once()
+
+	actionsClient.On("Enqueue", mock.Anything, mock.MatchedBy(func(req *connect.Request[actions.EnqueueRequest]) bool {
+		return req.Msg.GetAction().GetTask().GetSpec().GetTaskTemplate().GetMetadata().GetPodTemplateName() == "gpu-template"
 	})).Return(connect.NewResponse(&actions.EnqueueResponse{}), nil).Once()
 
 	_, err := svc.CreateRun(context.Background(), connect.NewRequest(req))
