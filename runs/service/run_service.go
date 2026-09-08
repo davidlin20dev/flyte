@@ -291,6 +291,7 @@ func (s *RunService) CreateRun(
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 	applyRunSettings(runSpec, resolved)
+	applyTaskSettings(taskSpec, resolved)
 
 	// Stamp the run start time, but only for SDKs that understand it (>= 2.3.6) — older task
 	// templates have no {{.runStartTime}} placeholder, so leaving it unset keeps the executor from
